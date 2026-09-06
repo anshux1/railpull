@@ -304,8 +304,14 @@ class LockUnavailable(RuntimeError):
 
 
 def is_transient_ntes_error(exc):
-    """Recover the distinction hidden by ntes-client's broad NTESError wrapper."""
+    """Recover semantic no-match responses from ntes-client's broad wrapper."""
     message = str(exc).strip().lower()
+    # ntes-client wraps an empty prefix/search result as a generic request
+    # failure. During discovery this is a normal, successful result: the
+    # prefix has no trains and should be marked done instead of retried until
+    # the watchdog restarts the whole crawl.
+    if "no match found" in message:
+        return False
     transient_markers = (
         "request failed:",
         "empty response",
