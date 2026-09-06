@@ -122,6 +122,11 @@ instances:
 ./crawler-manager logs --no-follow --lines 200
 ```
 
+Process checks are portable: Linux uses `/proc` when available, while macOS
+and other POSIX hosts use `ps`. If persisted state says `RUNNING` but neither
+PID can be verified, `status` reports `STALE` instead of presenting old state
+as a live crawl.
+
 To run the crawler directly, use `python ntes/crawl.py`. The schedule stage
 uses four bounded workers by default, while one global limiter keeps request
 starts at least 1.2 seconds apart plus jitter. This overlaps network latency

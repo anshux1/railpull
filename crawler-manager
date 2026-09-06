@@ -41,6 +41,7 @@ DEFAULT_MAX_RESTART_DELAY = 3600.0
 DEFAULT_STOP_TIMEOUT = 45.0
 DEFAULT_LOG_BYTES = 50 * 1024 * 1024
 DEFAULT_LOG_BACKUPS = 5
+PROCESS_QUERY_TIMEOUT = 2.0
 
 _stop_requested = False
 _echo_logs = True
@@ -151,46 +152,129 @@ def remove_pid(path, expected=None):
             pass
 
 
-def proc_cmdline(pid):
+def _procfs_process_info(pid):
+    """Read process identity from Linux procfs when it is available."""
     try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
-    except (FileNotFoundError, OSError):
-        return ""
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        after_comm = stat.rsplit(")", 1)[-1].strip()
+        state = after_comm.split(None, 1)[0] if after_comm else ""
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+    return {"pid": pid, "state": state, "command": command.strip()}
+
+
+def _parse_ps_process_line(line):
+    """Parse one line from ``ps -o pid=,stat=,pcpu=,rss=,etime=,args=``."""
+    fields = line.strip().split(None, 5)
+    if len(fields) < 2:
+        return None
+    try:
+        parsed_pid = int(fields[0])
+    except (TypeError, ValueError):
+        return None
+    info = {
+        "pid": parsed_pid,
+        "state": fields[1],
+        "command": fields[5].strip() if len(fields) > 5 else "",
+    }
+    if len(fields) > 2:
+        info["cpuPercent"] = fields[2]
+    if len(fields) > 3:
+        info["rssKiB"] = fields[3]
+    if len(fields) > 4:
+        info["elapsed"] = fields[4]
+    return info
+
+
+def _ps_process_info(pid):
+    """Read process identity and resource fields through portable BSD/GNU ps."""
+    try:
+        result = subprocess.run(
+            [
+                # BSD ps truncates command lines unless wide output is
+                # requested; the manager path can otherwise disappear from a
+                # long macOS Python command line.
+                "ps", "-ww", "-p", str(pid),
+                "-o", "pid=", "-o", "stat=", "-o", "pcpu=", "-o", "rss=",
+                "-o", "etime=", "-o", "args=",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_QUERY_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        info = _parse_ps_process_line(line)
+        if info and info["pid"] == pid:
+            return info
+    return None
+
+
+def _process_info(pid):
+    """Return process metadata using procfs or ps, independent of host OS.
+
+    PID files alone are not sufficient because a PID can be reused after a
+    process exits. Callers therefore use the command line returned here to
+    verify that the PID still belongs to this manager or crawler.
+    """
+    if not pid or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        if exc.errno != errno.EPERM:
+            return None
+
+    procfs_info = _procfs_process_info(pid)
+    if procfs_info is not None:
+        if procfs_info["state"].startswith("Z"):
+            return None
+        if procfs_info["command"]:
+            return procfs_info
+
+    ps_info = _ps_process_info(pid)
+    if ps_info is None or ps_info["state"].startswith("Z"):
+        return None
+    return ps_info
+
+
+def proc_cmdline(pid):
+    """Return a process command line on Linux, macOS, and other POSIX hosts."""
+    info = _process_info(pid)
+    return info["command"] if info else ""
 
 
 def process_alive(pid):
-    if not pid or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    except OSError as exc:
-        return exc.errno == errno.EPERM
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        after_comm = stat.rsplit(")", 1)[-1].strip()
-        if after_comm.startswith("Z ") or after_comm == "Z":
-            return False
-    except (FileNotFoundError, OSError):
-        pass
-    return True
+    return _process_info(pid) is not None
 
 
 def manager_process(pid):
-    command = proc_cmdline(pid)
-    return (
-        process_alive(pid)
-        and "crawler-manager" in command
-        and ("_supervise" in command or " foreground" in command)
-    )
+    info = _process_info(pid)
+    if not info:
+        return False
+    command = info["command"]
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return "crawler-manager" in command and ("_supervise" in tokens or "foreground" in tokens)
 
 
 def crawler_process(pid):
-    command = proc_cmdline(pid)
+    info = _process_info(pid)
+    if not info:
+        return False
+    command = info["command"]
     expected = os.environ.get("RAILPULL_CRAWLER", str(CRAWLER))
     expected_name = Path(expected).name
-    return process_alive(pid) and ("ntes/crawl.py" in command or expected_name in command)
+    return "ntes/crawl.py" in command or expected_name in command
 
 
 def crawler_lock_held():
@@ -274,6 +358,51 @@ def format_bytes(value):
         value /= 1024
 
 
+def _parse_elapsed(value):
+    """Convert ps elapsed formats (MM:SS, HH:MM:SS, DD-HH:MM:SS) to seconds."""
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        days = 0
+        if "-" in text:
+            day_text, text = text.split("-", 1)
+            days = int(day_text)
+        parts = text.split(":")
+        if len(parts) == 3:
+            hours, minutes, seconds = parts
+            return days * 86400 + int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        if len(parts) == 2:
+            minutes, seconds = parts
+            return days * 86400 + int(minutes) * 60 + float(seconds)
+        if len(parts) == 1:
+            return days * 86400 + float(parts[0])
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _ps_process_stats(pid):
+    info = _ps_process_info(pid)
+    if not info:
+        return {}
+    try:
+        cpu_percent = float(info.get("cpuPercent"))
+    except (TypeError, ValueError):
+        cpu_percent = None
+    try:
+        memory_bytes = float(info.get("rssKiB")) * 1024
+    except (TypeError, ValueError):
+        memory_bytes = None
+    runtime = _parse_elapsed(info.get("elapsed"))
+    return {
+        "cpuPercent": round(cpu_percent, 2) if cpu_percent is not None else None,
+        "memoryBytes": int(memory_bytes) if memory_bytes is not None else None,
+        "startedEpoch": time.time() - runtime if runtime is not None else None,
+        "runtimeSeconds": runtime,
+    }
+
+
 def process_stats(pid):
     if not crawler_process(pid):
         return {}
@@ -303,12 +432,18 @@ def process_stats(pid):
                 break
     except (FileNotFoundError, OSError, ValueError, IndexError):
         pass
-    return {
+    stats = {
         "cpuPercent": round(cpu_percent, 2) if cpu_percent is not None else None,
         "memoryBytes": rss,
         "startedEpoch": started_epoch,
         "runtimeSeconds": runtime,
     }
+    if any(value is None for value in stats.values()):
+        portable = _ps_process_stats(pid)
+        for key, value in portable.items():
+            if stats.get(key) is None and value is not None:
+                stats[key] = value
+    return stats
 
 
 def crawler_command():
@@ -655,7 +790,10 @@ def print_status():
     elif manager_running:
         overall = "RESTARTING"
     else:
-        overall = str(state.get("status") or crawl.get("phase") or "STOPPED").upper()
+        persisted = str(state.get("status") or crawl.get("phase") or "STOPPED").upper()
+        # A persisted RUNNING state survives an abrupt process exit. Do not
+        # report that stale value as live when neither PID can be verified.
+        overall = "STALE" if persisted in ("RUNNING", "RESTARTING") else persisted
     if crawler_running:
         started = parse_datetime(crawl.get("runStartedAt") or crawl.get("startedAt"))
     elif manager_running:
@@ -678,6 +816,8 @@ def print_status():
     else:
         eta_text = format_duration(eta)
     last_error = crawl.get("lastError") or state.get("lastError") or "none"
+    if overall == "STALE" and last_error == "none":
+        last_error = "manager and crawler processes are not running"
     checkpoint = crawl.get("lastCheckpointAt") or "unknown"
     current = crawl.get("currentTask") or state.get("currentPhase") or "unknown"
 
