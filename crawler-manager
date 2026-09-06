@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""Process manager, watchdog, and status CLI for the NTES crawler.
+
+The manager is intentionally dependency-free. ``start`` daemonizes a private
+supervisor process; ``foreground`` is provided for systemd and other service
+managers. The supervisor owns a lock for its lifetime, launches at most one
+crawler child, checks its heartbeat, and restarts unfinished/failed runs with
+backoff. All state lives below data/runtime, which is ignored by git.
+"""
+import argparse
+import collections
+import datetime as dt
+import errno
+import fcntl
+import json
+import os
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+RUNTIME = ROOT / "data" / "runtime"
+LOG = RUNTIME / "crawler-manager.log"
+MANAGER_PID = RUNTIME / "manager.pid"
+CRAWLER_PID = RUNTIME / "crawler.pid"
+MANAGER_STATE = RUNTIME / "manager-state.json"
+CRAWL_STATUS = ROOT / "data" / "raw" / "crawl-status.json"
+MANAGER_LOCK = RUNTIME / "manager.lock"
+START_LOCK = RUNTIME / "manager-start.lock"
+CRAWLER = ROOT / "ntes" / "crawl.py"
+
+DEFAULT_HEALTH_INTERVAL = 15.0
+DEFAULT_HANG_TIMEOUT = 900.0
+DEFAULT_RESTART_DELAY = 10.0
+DEFAULT_MAX_RESTART_DELAY = 3600.0
+DEFAULT_STOP_TIMEOUT = 45.0
+DEFAULT_LOG_BYTES = 50 * 1024 * 1024
+DEFAULT_LOG_BACKUPS = 5
+
+_stop_requested = False
+_echo_logs = True
+
+
+def load_env_file():
+    """Load an optional project .env without adding a dotenv dependency."""
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ[key] = value
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def atomic_write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def load_json(path, default):
+    try:
+        with path.open(encoding="utf-8") as fh:
+            value = json.load(fh)
+        return value
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return default
+
+
+def rotate_log():
+    maximum = max(1024, env_int("RAILPULL_LOG_MAX_BYTES", DEFAULT_LOG_BYTES))
+    backups = max(1, env_int("RAILPULL_LOG_BACKUPS", DEFAULT_LOG_BACKUPS))
+    if not LOG.exists() or LOG.stat().st_size < maximum:
+        return
+    for index in range(backups, 0, -1):
+        source = LOG if index == 1 else Path(f"{LOG}.{index - 1}")
+        target = Path(f"{LOG}.{index}")
+        if source.exists():
+            source.replace(target)
+
+
+def manager_log(message, echo=True):
+    line = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} manager: {message}\n"
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+        fh.flush()
+    if echo and _echo_logs:
+        print(line, end="", flush=True)
+
+
+def write_pid(path, pid):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(f"{pid}\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_pid(path):
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def remove_pid(path, expected=None):
+    current = read_pid(path)
+    if expected is None or current == expected:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def proc_cmdline(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def process_alive(pid):
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        after_comm = stat.rsplit(")", 1)[-1].strip()
+        if after_comm.startswith("Z ") or after_comm == "Z":
+            return False
+    except (FileNotFoundError, OSError):
+        pass
+    return True
+
+
+def manager_process(pid):
+    command = proc_cmdline(pid)
+    return (
+        process_alive(pid)
+        and "crawler-manager" in command
+        and ("_supervise" in command or " foreground" in command)
+    )
+
+
+def crawler_process(pid):
+    command = proc_cmdline(pid)
+    expected = os.environ.get("RAILPULL_CRAWLER", str(CRAWLER))
+    expected_name = Path(expected).name
+    return process_alive(pid) and ("ntes/crawl.py" in command or expected_name in command)
+
+
+def crawler_lock_held():
+    """Probe the crawler lock without taking ownership of it."""
+    lock_path = ROOT / "data" / "runtime" / "crawler.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        with lock_path.open("a+", encoding="utf-8") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    return True
+                raise
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
+def write_state(**fields):
+    state = load_json(MANAGER_STATE, {})
+    if not isinstance(state, dict):
+        state = {}
+    state.update(fields)
+    state["updatedAt"] = now_iso()
+    atomic_write_json(MANAGER_STATE, state)
+    return state
+
+
+def parse_datetime(value):
+    if not value:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def seconds_until(value):
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return 0.0
+    return max(0.0, (parsed - dt.datetime.now(dt.timezone.utc)).total_seconds())
+
+
+def format_duration(seconds):
+    if seconds is None:
+        return "unknown"
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "unknown"
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def format_bytes(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def process_stats(pid):
+    if not crawler_process(pid):
+        return {}
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = raw.rsplit(")", 1)[1].strip().split()
+        ticks = float(os.sysconf(os.sysconf_names["SC_CLK_TCK"]))
+        cpu_seconds = (float(fields[11]) + float(fields[12])) / ticks
+        start_ticks = float(fields[19])
+        btime = 0.0
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                btime = float(line.split()[1])
+                break
+        started_epoch = btime + start_ticks / ticks if btime else time.time()
+        runtime = max(0.001, time.time() - started_epoch)
+        cpu_percent = cpu_seconds / runtime * 100.0
+    except (FileNotFoundError, OSError, ValueError, IndexError, KeyError):
+        cpu_percent = None
+        started_epoch = None
+        runtime = None
+    rss = None
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                rss = int(line.split()[1]) * 1024
+                break
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        pass
+    return {
+        "cpuPercent": round(cpu_percent, 2) if cpu_percent is not None else None,
+        "memoryBytes": rss,
+        "startedEpoch": started_epoch,
+        "runtimeSeconds": runtime,
+    }
+
+
+def crawler_command():
+    python = os.environ.get("RAILPULL_PYTHON", sys.executable)
+    crawler = os.environ.get("RAILPULL_CRAWLER", str(CRAWLER))
+    if not os.path.isabs(crawler):
+        crawler = str(ROOT / crawler)
+    command = [python, "-u", crawler]
+    extra = os.environ.get("RAILPULL_CRAWL_ARGS", "")
+    if extra:
+        command.extend(shlex.split(extra))
+    return command
+
+
+def stop_child(proc, reason, timeout=None):
+    if proc is None or proc.poll() is not None:
+        return proc.returncode if proc is not None else None
+    timeout = DEFAULT_STOP_TIMEOUT if timeout is None else timeout
+    manager_log(f"stopping crawler PID {proc.pid}: {reason}")
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return proc.poll()
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.25)
+    if proc.poll() is None:
+        manager_log(f"crawler PID {proc.pid} did not stop after {int(timeout)}s; killing it")
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    return proc.wait()
+
+
+def signal_handler(signum, _frame):
+    global _stop_requested
+    _stop_requested = True
+    manager_log(f"received signal {signum}; supervisor is shutting down")
+
+
+def launch_crawler():
+    rotate_log()
+    log_handle = LOG.open("a", encoding="utf-8", buffering=1)
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    try:
+        proc = subprocess.Popen(
+            crawler_command(), cwd=str(ROOT), env=environment,
+            stdin=subprocess.DEVNULL, stdout=log_handle, stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        log_handle.close()
+        raise
+    finally:
+        log_handle.close()
+    write_pid(CRAWLER_PID, proc.pid)
+    manager_log(f"starting crawler; PID {proc.pid}")
+    return proc
+
+
+def supervisor(ready_fd=None):
+    """Run the long-lived watchdog loop. Returns a process exit code."""
+    global _stop_requested, _echo_logs
+    _stop_requested = False
+    _echo_logs = ready_fd is None
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    lock_handle = MANAGER_LOCK.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if ready_fd is not None:
+                os.write(ready_fd, b"0")
+                os.close(ready_fd)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return 1
+            raise
+        manager_pid = os.getpid()
+        previous = load_json(MANAGER_STATE, {})
+        if not isinstance(previous, dict):
+            previous = {}
+        cumulative_restarts = int(previous.get("restarts", 0) or 0)
+        write_pid(MANAGER_PID, manager_pid)
+        write_state(
+            status="RUNNING", managerPid=manager_pid, managerStartedAt=now_iso(),
+            lastError="", cumulativeStarts=int(previous.get("cumulativeStarts", 0) or 0) + 1,
+        )
+        if ready_fd is not None:
+            os.write(ready_fd, b"1")
+            os.close(ready_fd)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, signal_handler)
+
+        health_interval = max(2.0, env_float("RAILPULL_HEALTH_INTERVAL", DEFAULT_HEALTH_INTERVAL))
+        hang_timeout = max(60.0, env_float("RAILPULL_HANG_TIMEOUT", DEFAULT_HANG_TIMEOUT))
+        restart_base = max(1.0, env_float("RAILPULL_RESTART_DELAY", DEFAULT_RESTART_DELAY))
+        restart_max = max(restart_base, env_float("RAILPULL_MAX_RESTART_DELAY", DEFAULT_MAX_RESTART_DELAY))
+        max_restarts = max(0, env_int("RAILPULL_MAX_RESTARTS", 0))
+        restart_attempts = 0
+        proc = None
+        while not _stop_requested:
+            if max_restarts and restart_attempts >= max_restarts:
+                manager_log(f"maximum restart count ({max_restarts}) reached; stopping")
+                write_state(status="BLOCKED", managerPid=manager_pid, lastError="maximum restarts reached")
+                return 1
+            try:
+                proc = launch_crawler()
+            except Exception as exc:
+                restart_attempts += 1
+                cumulative_restarts += 1
+                manager_log(f"could not launch crawler: {type(exc).__name__}: {exc}")
+                write_state(
+                    status="RESTARTING", managerPid=manager_pid, restarts=cumulative_restarts,
+                    lastExitCode=None, lastError=f"launch: {type(exc).__name__}: {exc}",
+                )
+                delay = min(restart_max, restart_base * (2 ** min(restart_attempts - 1, 6)))
+                _stop_event_wait(delay)
+                continue
+
+            launched_at = time.monotonic()
+            hang_reason = None
+            while proc.poll() is None and not _stop_requested:
+                time.sleep(health_interval)
+                if proc.poll() is not None or _stop_requested:
+                    break
+                crawl_status = load_json(CRAWL_STATUS, {})
+                if not isinstance(crawl_status, dict):
+                    crawl_status = {}
+                phase = str(crawl_status.get("phase", "starting")).upper()
+                heartbeat = parse_datetime(crawl_status.get("heartbeatAt") or crawl_status.get("updatedAt"))
+                status_pid = crawl_status.get("pid")
+                try:
+                    status_pid = int(status_pid)
+                except (TypeError, ValueError):
+                    status_pid = None
+                heartbeat_age = (
+                    (dt.datetime.now(dt.timezone.utc) - heartbeat).total_seconds()
+                    if heartbeat else 0
+                )
+                if status_pid != proc.pid:
+                    # Do not mistake a previous run's DONE document for a
+                    # healthy newly launched process that never initialized.
+                    phase = "STARTING"
+                    heartbeat_age = time.monotonic() - launched_at
+                # Allow process startup and dependency import a short grace period.
+                if (
+                    time.monotonic() - launched_at > min(120.0, hang_timeout)
+                    and phase not in ("DONE", "STOPPED")
+                    and heartbeat_age > hang_timeout
+                ):
+                    hang_reason = f"heartbeat stale for {int(heartbeat_age)}s (phase={phase})"
+                    manager_log(f"detected crawler hang: {hang_reason}")
+                    stop_child(proc, hang_reason)
+                    break
+                write_state(
+                    status="RUNNING", managerPid=manager_pid, crawlerPid=proc.pid,
+                    restarts=cumulative_restarts, currentPhase=phase,
+                )
+
+            if _stop_requested:
+                stop_child(proc, "manager shutdown")
+                break
+            return_code = proc.wait()
+            remove_pid(CRAWLER_PID, proc.pid)
+            crawl_status = load_json(CRAWL_STATUS, {})
+            if not isinstance(crawl_status, dict):
+                crawl_status = {}
+            phase = str(crawl_status.get("phase", "UNKNOWN")).upper()
+            retryable = int(crawl_status.get("retryableErrors", 0) or 0)
+            done = return_code == 0 and phase == "DONE" and retryable == 0
+            if done:
+                manager_log("crawler completed successfully; watchdog is idle")
+                write_state(
+                    status="COMPLETED", managerPid=manager_pid, crawlerPid=None,
+                    restarts=cumulative_restarts, lastExitCode=return_code,
+                    lastError="", currentPhase=phase,
+                )
+                return 0
+
+            restart_attempts += 1
+            cumulative_restarts += 1
+            reason = hang_reason or f"crawler exited with code {return_code} (phase={phase})"
+            manager_log(f"detected crawler failure: {reason}")
+            write_state(
+                status="RESTARTING", managerPid=manager_pid, crawlerPid=None,
+                restarts=cumulative_restarts, lastExitCode=return_code,
+                lastError=reason, currentPhase=phase,
+            )
+            backoff = min(restart_max, restart_base * (2 ** min(restart_attempts - 1, 6)))
+            retry_wait = seconds_until(crawl_status.get("nextRetryAt"))
+            delay = max(backoff, retry_wait)
+            manager_log(f"restarting crawler in {format_duration(delay)}; resuming from checkpoint")
+            _stop_event_wait(delay)
+
+        write_state(status="STOPPED", managerPid=manager_pid, crawlerPid=None, restarts=cumulative_restarts)
+        manager_log("watchdog stopped")
+        return 0
+    finally:
+        remove_pid(MANAGER_PID, os.getpid())
+        remove_pid(CRAWLER_PID)
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
+
+
+def _stop_event_wait(seconds):
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not _stop_requested and time.monotonic() < deadline:
+        time.sleep(min(1.0, deadline - time.monotonic()))
+
+
+def command_start():
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    current = read_pid(MANAGER_PID)
+    if current and manager_process(current):
+        print(f"crawler manager already running (PID {current})")
+        return 0
+    if current:
+        remove_pid(MANAGER_PID, current)
+    start_lock = START_LOCK.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(start_lock.fileno(), fcntl.LOCK_EX)
+        current = read_pid(MANAGER_PID)
+        if current and manager_process(current):
+            print(f"crawler manager already running (PID {current})")
+            return 0
+        if current:
+            remove_pid(MANAGER_PID, current)
+        if crawler_lock_held():
+            print("a crawler is already running; stop it before starting the manager", file=sys.stderr)
+            return 1
+        rotate_log()
+        ready_read, ready_write = os.pipe()
+        environment = os.environ.copy()
+        environment["RAILPULL_MANAGER_READY_FD"] = str(ready_write)
+        log_handle = LOG.open("a", encoding="utf-8", buffering=1)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "_supervise"],
+                cwd=str(ROOT), env=environment, stdin=subprocess.DEVNULL,
+                stdout=log_handle, stderr=subprocess.STDOUT,
+                start_new_session=True, pass_fds=(ready_write,),
+            )
+        finally:
+            log_handle.close()
+            os.close(ready_write)
+        try:
+            ready = b""
+            readable, _, _ = select.select([ready_read], [], [], 8.0)
+            if readable:
+                ready = os.read(ready_read, 1)
+        finally:
+            os.close(ready_read)
+        if ready != b"1":
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            print("failed to start crawler manager; inspect data/runtime/crawler-manager.log", file=sys.stderr)
+            return 1
+        print(f"Starting crawler manager (PID {proc.pid})")
+        print("Crawler will resume from data/raw checkpoints")
+        return 0
+    finally:
+        fcntl.flock(start_lock.fileno(), fcntl.LOCK_UN)
+        start_lock.close()
+
+
+def command_stop():
+    manager_pid = read_pid(MANAGER_PID)
+    crawler_pid = read_pid(CRAWLER_PID)
+    if not manager_pid or not manager_process(manager_pid):
+        if manager_pid:
+            remove_pid(MANAGER_PID, manager_pid)
+        if crawler_pid and crawler_process(crawler_pid):
+            manager_log(f"stopping orphan crawler PID {crawler_pid}")
+            try:
+                os.kill(crawler_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + max(5.0, env_float("RAILPULL_STOP_TIMEOUT", DEFAULT_STOP_TIMEOUT))
+            while crawler_process(crawler_pid) and time.monotonic() < deadline:
+                time.sleep(0.25)
+            if crawler_process(crawler_pid):
+                try:
+                    os.kill(crawler_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            print(f"Stopped orphan crawler PID {crawler_pid}")
+            return 0
+        print("crawler manager is not running")
+        return 0
+    print(f"Stopping crawler manager PID {manager_pid} …")
+    try:
+        os.kill(manager_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + max(5.0, env_float("RAILPULL_STOP_TIMEOUT", DEFAULT_STOP_TIMEOUT) + 5)
+    while manager_process(manager_pid) and time.monotonic() < deadline:
+        time.sleep(0.25)
+    if manager_process(manager_pid):
+        print("manager did not stop gracefully; sending SIGKILL", file=sys.stderr)
+        try:
+            os.kill(manager_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    crawler_pid = read_pid(CRAWLER_PID)
+    if crawler_pid and crawler_process(crawler_pid):
+        try:
+            os.kill(crawler_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    remove_pid(MANAGER_PID)
+    remove_pid(CRAWLER_PID)
+    print("Stopped")
+    return 0
+
+
+def command_restart():
+    command_stop()
+    return command_start()
+
+
+def status_line(label, value):
+    print(f"{label}: {value}")
+
+
+def print_status():
+    manager_pid = read_pid(MANAGER_PID)
+    manager_running = manager_process(manager_pid)
+    crawler_pid = read_pid(CRAWLER_PID)
+    crawler_running = crawler_process(crawler_pid)
+    crawl = load_json(CRAWL_STATUS, {})
+    if not isinstance(crawl, dict):
+        crawl = {}
+    state = load_json(MANAGER_STATE, {})
+    if not isinstance(state, dict):
+        state = {}
+    if crawler_running:
+        overall = "RUNNING"
+    elif manager_running:
+        overall = "RESTARTING"
+    else:
+        overall = str(state.get("status") or crawl.get("phase") or "STOPPED").upper()
+    if crawler_running:
+        started = parse_datetime(crawl.get("runStartedAt") or crawl.get("startedAt"))
+    elif manager_running:
+        started = parse_datetime(state.get("managerStartedAt"))
+    else:
+        started = parse_datetime(crawl.get("runStartedAt") or crawl.get("startedAt"))
+    runtime = (dt.datetime.now(dt.timezone.utc) - started).total_seconds() if started else None
+    stats = process_stats(crawler_pid) if crawler_running else {}
+    total = crawl.get("total")
+    completed = crawl.get("completed")
+    remaining = crawl.get("remaining")
+    percent = None
+    try:
+        percent = float(completed) / float(total) * 100 if float(total) else 100.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    eta = crawl.get("etaSeconds")
+    if eta is None:
+        eta_text = "unknown"
+    else:
+        eta_text = format_duration(eta)
+    last_error = crawl.get("lastError") or state.get("lastError") or "none"
+    checkpoint = crawl.get("lastCheckpointAt") or "unknown"
+    current = crawl.get("currentTask") or state.get("currentPhase") or "unknown"
+
+    print("Crawler Status")
+    print("==============")
+    status_line("Status", overall)
+    status_line("Manager PID", manager_pid if manager_running else "not running")
+    status_line("Crawler PID", crawler_pid if crawler_running else "not running")
+    status_line("Started", started.isoformat() if started else "unknown")
+    status_line("Runtime", format_duration(runtime))
+    status_line("CPU", f"{stats['cpuPercent']:.2f}%" if stats.get("cpuPercent") is not None else "unknown")
+    status_line("Memory", format_bytes(stats.get("memoryBytes")))
+    print("\nProgress:")
+    print("------------------")
+    status_line("Completed", completed if completed is not None else "unknown")
+    status_line("Total", total if total is not None else "unknown")
+    status_line("Remaining", remaining if remaining is not None else "unknown")
+    status_line("Percent", f"{percent:.2f}%" if percent is not None else "unknown")
+    status_line("Speed", f"{crawl.get('speedPerMinute', 'unknown')} records/min")
+    status_line("ETA", eta_text)
+    status_line("Last checkpoint", checkpoint)
+    status_line("Last error", last_error)
+    status_line("Restarts", state.get("restarts", 0))
+    status_line("Current task", current)
+    status_line("Stage", crawl.get("stage") or state.get("currentPhase") or "unknown")
+    status_line("Heartbeat", crawl.get("heartbeatAt") or "unknown")
+    return 0
+
+
+def command_logs(lines, follow):
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    if not LOG.exists():
+        print(f"no log yet: {LOG}")
+        return 0
+    try:
+        with LOG.open(encoding="utf-8", errors="replace") as fh:
+            tail = collections.deque(fh, maxlen=max(1, lines))
+            for line in tail:
+                print(line, end="")
+            if not follow:
+                return 0
+            while True:
+                line = fh.readline()
+                if line:
+                    print(line, end="", flush=True)
+                else:
+                    time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+
+
+def main(argv=None):
+    load_env_file()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "_supervise":
+        ready_fd = os.environ.get("RAILPULL_MANAGER_READY_FD")
+        return supervisor(int(ready_fd) if ready_fd else None)
+    if argv and argv[0] == "foreground":
+        return supervisor()
+
+    parser = argparse.ArgumentParser(description="Manage and monitor the railpull NTES crawler")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("start", help="start the background watchdog and crawler")
+    sub.add_parser("stop", help="gracefully stop the watchdog and crawler")
+    sub.add_parser("restart", help="stop, then start the watchdog")
+    sub.add_parser("status", help="show process, resource, and crawl progress")
+    sub.add_parser("progress", help="alias for status")
+    logs = sub.add_parser("logs", help="show manager/crawler logs")
+    logs.add_argument("--lines", type=int, default=100)
+    logs.add_argument("--no-follow", action="store_true", help="print current lines and exit")
+    args = parser.parse_args(argv)
+    if args.command == "start":
+        return command_start()
+    if args.command == "stop":
+        return command_stop()
+    if args.command == "restart":
+        return command_restart()
+    if args.command in ("status", "progress"):
+        return print_status()
+    if args.command == "logs":
+        return command_logs(args.lines, not args.no_follow)
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

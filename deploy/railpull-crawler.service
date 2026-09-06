@@ -1,0 +1,18 @@
+[Unit]
+Description=railpull NTES timetable crawler watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Replace both paths with the real checkout and virtual environment.
+WorkingDirectory=/opt/railpull
+ExecStart=/opt/railpull/crawler-manager foreground
+Environment=RAILPULL_PYTHON=/opt/railpull/.venv/bin/python
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
