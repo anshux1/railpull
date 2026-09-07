@@ -20,6 +20,11 @@ class NtesErrorClassificationTests(unittest.TestCase):
 
         self.assertTrue(crawl.is_transient_ntes_error(error))
 
+    def test_invalid_train_number_is_semantic_not_transient(self):
+        error = Exception("NTESError: request failed: Invalid Train No./Name 00816 !")
+
+        self.assertFalse(crawl.is_transient_ntes_error(error))
+
 
 if __name__ == "__main__":
     unittest.main()
